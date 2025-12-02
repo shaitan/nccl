@@ -967,8 +967,10 @@ ncclResult_t ncclTopoDupChannels(struct ncclTopoGraph* graph, int ccMin, int ngp
   int dupChannels = std::min(graph->nChannels*2, graph->maxChannels);
   memcpy(graph->intra+graph->nChannels*ngpus, graph->intra, (dupChannels-graph->nChannels)*ngpus*sizeof(int));
   memcpy(graph->inter+graph->nChannels*2,graph->inter, (dupChannels-graph->nChannels)*2*sizeof(int64_t));
+  INFO(NCCL_TUNING, "ncclTopoDupChannels: graph->bwIntra[%f] /= DIVUP(dupChannels[%d], graph->nChannels[%d]) (before: %f)", graph->bwIntra / DIVUP(dupChannels, graph->nChannels), dupChannels, graph->nChannels, graph->bwIntra);
   graph->bwIntra /= DIVUP(dupChannels, graph->nChannels);
   graph->bwInter /= DIVUP(dupChannels, graph->nChannels);
+  INFO(NCCL_TUNING, "ncclTopoDupChannels: graph->nChannels[%d] = dupChannels[%d]", graph->nChannels, dupChannels);
   graph->nChannels = dupChannels;
   return ncclSuccess;
 }
@@ -1071,8 +1073,11 @@ ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph
   int speedIndex = 0;
   float maxBw = system->maxBw;
   float totalBw = system->totalBw;
+  INFO(NCCL_TUNING, "Pattern %d, maxBw: %f, totalBw: %f, graph->nChannels: %d", graph->pattern, maxBw, totalBw, graph->nChannels);
   if (ngpus > 1 && graph->pattern != NCCL_TOPO_PATTERN_RING) totalBw *= ngpus*1.0/(ngpus-1);
+  INFO(NCCL_TUNING, "Pattern %d after if: totalBw: %f, graph->minChannels: %d, graph->nChannels: %d", graph->pattern, totalBw, graph->minChannels, graph->nChannels);
   while ((speedArray[speedIndex] > maxBw || speedArray[speedIndex]*graph->minChannels > totalBw) && speedIndex < nspeeds-1) speedIndex++;
+  INFO(NCCL_TUNING, "Pattern %d after while: speedArray[%d] = %f, graph->nChannels: %d", graph->pattern, speedIndex, speedArray[speedIndex], graph->nChannels);
   tmpGraph.bwIntra = tmpGraph.bwInter = speedArray[speedIndex];
   int64_t globalTimeout = NCCL_SEARCH_GLOBAL_TIMEOUT;
 
@@ -1083,15 +1088,16 @@ search:
   globalTimeout -= time;
 
   NCCLCHECK(ncclTopoSearchRec(system, &tmpGraph, graph, &time));
+  INFO(NCCL_TUNING,"Pattern %d type %d/%d, channels %d-%d sameChannels %d -> nChannels %dx%g/%g %s", tmpGraph.pattern, tmpGraph.typeInter, tmpGraph.typeIntra, tmpGraph.minChannels, tmpGraph.maxChannels, tmpGraph.sameChannels, graph->nChannels, graph->bwInter, graph->bwIntra, time == 0 ? "TIMEOUT" : time == -1 ? "PERFECT" : "");
 #if 0
-  printf("Id %d Pattern %d, crossNic %d, Bw %g/%g, type %d/%d, channels %d-%d sameChannels %d -> nChannels %dx%g/%g %s\n", tmpGraph.id, tmpGraph.pattern, tmpGraph.crossNic, tmpGraph.bwInter, tmpGraph.bwIntra, tmpGraph.typeInter, tmpGraph.typeIntra, tmpGraph.minChannels, tmpGraph.maxChannels, tmpGraph.sameChannels, graph->nChannels, graph->bwInter, graph->bwIntra, time == 0 ? "TIMEOUT" : time == -1 ? "PERFECT" : "");
+  INFO(NCCL_TUNING,"Id %d Pattern %d, crossNic %d, Bw %g/%g, type %d/%d, channels %d-%d sameChannels %d -> nChannels %dx%g/%g %s\n", tmpGraph.id, tmpGraph.pattern, tmpGraph.crossNic, tmpGraph.bwInter, tmpGraph.bwIntra, tmpGraph.typeInter, tmpGraph.typeIntra, tmpGraph.minChannels, tmpGraph.maxChannels, tmpGraph.sameChannels, graph->nChannels, graph->bwInter, graph->bwIntra, time == 0 ? "TIMEOUT" : time == -1 ? "PERFECT" : "");
   for (int c=0; c<graph->nChannels; c++) {
-    printf("%2d : ", c);
+    INFO(NCCL_TUNING,"%2d : ", c);
     for (int g=0; g<ngpus; g++) {
-      printf("%d ", graph->intra[c*ngpus+g]);
+      INFO(NCCL_TUNING,"%d ", graph->intra[c*ngpus+g]);
     }
-    printf("[%lx %lx]", graph->inter[c*2+0], graph->inter[c*2+1]);
-    printf("\n");
+    INFO(NCCL_TUNING,"[%lx %lx]", graph->inter[c*2+0], graph->inter[c*2+1]);
+    INFO(NCCL_TUNING,"\n");
   }
 #endif
   // Optimal solution, stop here
@@ -1143,11 +1149,13 @@ search:
 
     // Decrease bw until we find a solution
     if ((speedIndex < nspeeds-1) && (graph->nChannels == 0 || (speedArray[speedIndex+1]/graph->bwInter > .49))) {
+      INFO(NCCL_TUNING, "Pattern %d: Decrease bw until we find a solution speedArray[%d] = %f, graph->nChannels: %d", graph->pattern, speedIndex+1, speedArray[speedIndex+1], graph->nChannels);
       tmpGraph.bwInter = tmpGraph.bwIntra = speedArray[++speedIndex];
       goto search;
     }
     speedIndex = 0;
     while (speedArray[speedIndex] > maxBw && speedIndex < nspeeds-1) speedIndex++;
+    INFO(NCCL_TUNING, "Pattern %d: another a solution speedArray[%d] = %f, graph->nChannels: %d", graph->pattern, speedIndex, speedArray[speedIndex], graph->nChannels);
     tmpGraph.bwIntra = tmpGraph.bwInter = speedArray[speedIndex];
 
   }
@@ -1160,6 +1168,7 @@ done:
     memcpy(&tmpGraph, graph, sizeof(tmpGraph));
     speedIndex = 0;
     while (speedArray[speedIndex] > graph->bwInter && speedIndex < nspeeds-1) speedIndex++;
+    INFO(NCCL_TUNING, "Pattern %d: we have a solution speedArray[%d] = %f, graph->bwInter: %f, graph->nChannels: %d", graph->pattern, speedIndex, speedArray[speedIndex], graph->bwInter, graph->nChannels);
     tmpGraph.bwIntra = tmpGraph.bwInter = speedArray[speedIndex];
     tmpGraph.minChannels = graph->nChannels;
     pass = 2;
@@ -1171,14 +1180,17 @@ done:
       if (graph->pattern == NCCL_TOPO_PATTERN_RING) {
         // increase bw for Ring
         tmpGraph.bwIntra = tmpGraph.bwInter = speedArray[--speedIndex];
+        INFO(NCCL_TUNING, "Pattern %d: increase bw for ring speedArray[%d] = %f, graph->nChannels: %d", graph->pattern, speedIndex, speedArray[speedIndex], graph->nChannels);
         goto search;
       } else if (graph->pattern == NCCL_TOPO_PATTERN_NVLS && tmpGraph.bwInter == graph->bwInter && tmpGraph.bwInter < tmpGraph.bwIntra*2) {
         tmpGraph.minChannels = tmpGraph.maxChannels = graph->nChannels;
         tmpGraph.bwInter = speedArray[--speedIndex];
+        INFO(NCCL_TUNING, "Pattern %d: increase bw for NVLS and few other options speedArray[%d] = %f, graph->nChannels: %d", graph->pattern, speedIndex, speedArray[speedIndex], graph->nChannels);
         goto search;
       } else if (tmpGraph.bwIntra == graph->bwIntra && tmpGraph.bwIntra < tmpGraph.bwInter*2) {
         // increase bwIntra for trees (2 nodes or collnet)
         tmpGraph.bwIntra = speedArray[--speedIndex];
+        INFO(NCCL_TUNING, "Pattern %d: increase bw for trees speedArray[%d] = %f, graph->nChannels: %d", graph->pattern, speedIndex, speedArray[speedIndex], graph->nChannels);
         goto search;
       }
     }
@@ -1187,7 +1199,7 @@ done:
   }
 
   if (graph->nChannels == 0 && graph->collNet == 0 && graph->pattern != NCCL_TOPO_PATTERN_NVLS) {
-    INFO(NCCL_GRAPH, "Could not find a path for pattern %d, falling back to simple order", graph->pattern);
+    INFO(NCCL_GRAPH, "Could not find a path for pattern %d, falling back to simple order, graph->nChannels: %d", graph->pattern, graph->nChannels);
     for (int i=0; i<ngpus; i++) graph->intra[i] = system->nodes[GPU].nodes[i].gpu.rank;
     graph->inter[0] = graph->inter[1] = 0;
     graph->bwIntra = graph->bwInter = 0.1;

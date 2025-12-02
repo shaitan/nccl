@@ -743,14 +743,14 @@ static ncclResult_t scheduleCollTasksToPlan(
         ncclProtoToString(task->protocol), devWork->channelLo, devWork->channelHi);
 
       if (task->isCollnet) {
-        TRACE(NCCL_COLL, "Collective %s(%s, %s, %s, %s) count=%ld devFuncId=%d channel{Lo..Hi}={%d..%d} count=%ld chunkCount=%d",
+        INFO(NCCL_TUNING, "Collective %s(%s, %s, %s, %s) count=%ld devFuncId=%d channel{Lo..Hi}={%d..%d} count=%ld chunkCount=%d",
           ncclFuncToString(task->func), ncclDevRedOpToString(task->opDev.op),
           ncclDatatypeToString(task->datatype), ncclAlgoToString(task->algorithm),
           ncclProtoToString(task->protocol),
           (long)task->count, task->devFuncId, devWork->channelLo, devWork->channelHi,
           (long)devWork->collnet.count, devWork->collnet.chunkCount);
       } else {
-        TRACE(NCCL_COLL, "Collective %s(%s, %s, %s, %s) count=%ld devFuncId=%d channel{Lo..Hi}={%d..%d} count{Lo,Mid,Hi}={%ld,%ld,%ld} chunkBytes{Lo,Mid,Hi}={%d,%d,%d}",
+        INFO(NCCL_TUNING, "Collective %s(%s, %s, %s, %s) count=%ld devFuncId=%d channel{Lo..Hi}={%d..%d} count{Lo,Mid,Hi}={%ld,%ld,%ld} chunkBytes{Lo,Mid,Hi}={%d,%d,%d}",
           ncclFuncToString(task->func), ncclDevRedOpToString(task->opDev.op),
           ncclDatatypeToString(task->datatype), ncclAlgoToString(task->algorithm),
           ncclProtoToString(task->protocol),
@@ -1831,6 +1831,7 @@ static ncclResult_t topoGetAlgoInfo(
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
       if (table[a][p] == NCCL_ALGO_PROTO_IGNORE) continue;
+      INFO(NCCL_TUNING, "%s %ld Bytes -> checking: Algo %s proto %s time %f, minTime %f", ncclFuncToString(info->func), nBytes, ncclAlgoToString(a), ncclProtoToString(p), table[a][p], minTime);
       if (table[a][p] >= 0.0 && table[a][p] < minTime) {
         algorithm = a;
         protocol = p;
@@ -1860,7 +1861,7 @@ static ncclResult_t topoGetAlgoInfo(
     return (algoEnv || protoEnv) ? ncclInvalidUsage : ncclInternalError;
   }
   if (simInfo) simInfo->estimatedTime = time;
-  TRACE(NCCL_COLL, "%ld Bytes -> Algo %d proto %d time %f", nBytes, info->algorithm, info->protocol, time);
+  INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s time %f", ncclFuncToString(info->func), nBytes, ncclAlgoToString(info->algorithm), ncclProtoToString(info->protocol), time);
 
   int nc = comm->nChannels;
   int nt = comm->maxThreads[info->algorithm][info->protocol];

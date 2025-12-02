@@ -256,9 +256,11 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   double perChMaxRingLL128Bw = comm->tunerConstants.perChMaxRingLL128Bws[compCapIndex][index2];
   double perChMaxTreeLL128Bw = comm->tunerConstants.perChMaxTreeLL128Bws[compCapIndex][index2];
   double perChMaxNVLSTreeBw = comm->tunerConstants.perChMaxNVLSTreeBws[compCapIndex][index2];
+  INFO(NCCL_TUNING, "ncclTopoTuneModel: compCapIndex: %d, index2: %d, index1: %d, llMaxBw: %f, perChMaxTreeBw: %f, perChMaxRingLL128Bw: %f, perChMaxTreeLL128Bw: %f, perChMaxNVLSTreeBw: %f", compCapIndex, index2, index1, llMaxBw, perChMaxTreeBw, perChMaxRingLL128Bw, perChMaxTreeLL128Bw, perChMaxNVLSTreeBw);
   // De-penalize Tree/Simple latency on Power systems to favor Tree than Ring
   if (comm->cpuArch == NCCL_TOPO_CPU_ARCH_POWER) comm->tunerConstants.hwLatencies[NCCL_HW_PCI][NCCL_ALGO_TREE][NCCL_PROTO_SIMPLE] = comm->tunerConstants.hwLatencies[NCCL_HW_PCI][NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
   float ppn = (float)nRanks / nNodes;
+  INFO(NCCL_TUNING, "ppn: %f", ppn);
 
   int intraHw[NCCL_NUM_ALGORITHMS], hw[NCCL_NUM_ALGORITHMS];
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) intraHw[a] = graphs[a]->typeIntra == LINK_NVL ? NCCL_HW_NVLINK : NCCL_HW_PCI;
@@ -268,6 +270,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
     int nsteps = coll == ncclFuncAllReduce ? 2*(nRanks-1) :
       coll == ncclFuncReduceScatter || coll == ncclFuncAllGather ? nRanks-1 :
       nRanks;
+    INFO(NCCL_TUNING, "%s: nsteps: %d", ncclFuncToString((ncclFunc_t)coll), nsteps);
 
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
       if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && a != NCCL_ALGO_RING) continue;
@@ -282,43 +285,83 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
             && a == NCCL_ALGO_PAT && (p != NCCL_PROTO_SIMPLE || ncclPatEnable(comm) == 0)) continue;
         int collnet = (a == NCCL_ALGO_COLLNET_DIRECT || a == NCCL_ALGO_COLLNET_CHAIN) ? 1 : 0;
         float bw = nNodes <= 2 || collnet ? graphs[a]->bwIntra : graphs[a]->bwInter;
+        INFO(NCCL_TUNING, "%s: bw: %f, graphs[%s]-bwIntra: %f, graphs[%s]->bwInter: %f", ncclFuncToString((ncclFunc_t)coll), bw, ncclAlgoToString(a), graphs[a]->bwIntra, ncclAlgoToString(a), graphs[a]->bwInter);
         if (a == NCCL_ALGO_NVLS_TREE || a == NCCL_ALGO_NVLS)
         {
           // NVLS/NVLStree needs at least 2 channels
           if (graphs[a]->nChannels < 2 ) continue;
           // Convert to NVLS busBW/channel
           float intraBw = graphs[a]->bwIntra * nvlsEfficiency[compCapIndex] * (graphs[a]->nChannels - 1) / graphs[a]->nChannels;
-	  // AllReduce pipelines two operations.
+          INFO(NCCL_TUNING, "%s: intraBw: %f", ncclFuncToString((ncclFunc_t)coll), intraBw);
+          // AllReduce pipelines two operations.
           if (coll == ncclFuncAllReduce) {
             intraBw *= 2.0f;
           } else {
             intraBw *= (ppn - 1) / ppn;
           }
+          INFO(NCCL_TUNING, "%s: intraBw after tune: %f", ncclFuncToString((ncclFunc_t)coll), intraBw);
           // Handle 2 node case of NVLSTree
           float interBw = graphs[a]->bwInter * ((nNodes <= 2 && a == NCCL_ALGO_NVLS_TREE) ? 2 : 1);
+          INFO(NCCL_TUNING, "%s: interBw: %f", ncclFuncToString((ncclFunc_t)coll), interBw);
           bw = std::min( {intraBw, interBw, a == NCCL_ALGO_NVLS_TREE ? (float)perChMaxNVLSTreeBw : std::numeric_limits<float>::max()} );
+          INFO(NCCL_TUNING, "%s: bw after bw = std::min(...): %f", ncclFuncToString((ncclFunc_t)coll), bw);
         };
         float busBw = graphs[a]->nChannels * bw;
+        INFO(NCCL_TUNING, "%s: busBw[%f] = graphs[a]->nChannels[%d] * bw[%f]", ncclFuncToString((ncclFunc_t)coll), busBw, graphs[a]->nChannels, bw);
 
         // Various model refinements
-        if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL) { busBw = std::min(llMaxBw, busBw * .5); }
-        if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL128) busBw = std::min(busBw * (0.92 /*120.0/128.0*/), graphs[a]->nChannels*perChMaxRingLL128Bw);
-        if (a == NCCL_ALGO_TREE && coll == ncclFuncAllReduce) busBw = std::min(busBw*.92, graphs[a]->nChannels*perChMaxTreeBw);
-        if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_LL) busBw = std::min(busBw*1.0/3.8, llMaxBw);
-        if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_LL128) busBw = std::min(busBw * (nNodes == 1 ? 7.0/9.0 : 120.0/128.0), graphs[a]->nChannels*perChMaxTreeLL128Bw);
-        if (a == NCCL_ALGO_TREE && comm->maxTreePattern == NCCL_TOPO_PATTERN_TREE) busBw *= .85;
-        if (a == NCCL_ALGO_PAT) busBw *= .75;
-        if (a == NCCL_ALGO_COLLNET_DIRECT && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
-        if (a == NCCL_ALGO_COLLNET_CHAIN && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
+        if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL) {
+          INFO(NCCL_TUNING, "%s: ring_ll refinement: busBw[%f] = std::min(llMaxBw[%f], busBw[%f] * .5)", ncclFuncToString((ncclFunc_t)coll), std::min(llMaxBw, busBw * .5), llMaxBw, busBw);
+          busBw = std::min(llMaxBw, busBw * .5);
+        }
+        if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL128) {
+          INFO(NCCL_TUNING, "%s: ring_ll128 refinement: busBw[%f] = std::min(busBw[%f] * (0.92 /*120.0/128.0*/), graphs[a]->nChannels[%d]*perChMaxRingLL128Bw[%f])", ncclFuncToString((ncclFunc_t)coll), std::min(busBw * (0.92 /*120.0/128.0*/), graphs[a]->nChannels*perChMaxRingLL128Bw), busBw, graphs[a]->nChannels, perChMaxRingLL128Bw);
+          busBw = std::min(busBw * (0.92 /*120.0/128.0*/), graphs[a]->nChannels*perChMaxRingLL128Bw);
+        }
+        if (a == NCCL_ALGO_TREE && coll == ncclFuncAllReduce) {
+          INFO(NCCL_TUNING, "%s: tree_allreduce refinement: busBw[%f] = std::min(busBw[%f]*.92, graphs[a]->nChannels[%d]*perChMaxTreeBw[%f])", ncclFuncToString((ncclFunc_t)coll), std::min(busBw*.92, graphs[a]->nChannels*perChMaxTreeBw), busBw, graphs[a]->nChannels, perChMaxTreeBw);
+          busBw = std::min(busBw*.92, graphs[a]->nChannels*perChMaxTreeBw);
+        }
+        if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_LL) {
+          INFO(NCCL_TUNING, "%s: tree_ll refinement: busBw[%f] = std::min(busBw[%f]*1.0/3.8, llMaxBw[%f])", ncclFuncToString((ncclFunc_t)coll), std::min(busBw*1.0/3.8, llMaxBw), busBw, llMaxBw);
+          busBw = std::min(busBw*1.0/3.8, llMaxBw);
+        }
+        if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_LL128) {
+          INFO(NCCL_TUNING, "%s: tree_ll128 refinement: busBw[%f] = std::min(busBw[%f] * (nNodes[%d] == 1 ? 7.0/9.0 : 120.0/128.0), graphs[a]->nChannels[%d]*perChMaxTreeLL128Bw[%f])", ncclFuncToString((ncclFunc_t)coll), std::min(busBw * (nNodes == 1 ? 7.0/9.0 : 120.0/128.0), graphs[a]->nChannels*perChMaxTreeLL128Bw), busBw, nNodes, graphs[a]->nChannels, perChMaxTreeLL128Bw);
+          busBw = std::min(busBw * (nNodes == 1 ? 7.0/9.0 : 120.0/128.0), graphs[a]->nChannels*perChMaxTreeLL128Bw);
+        }
+        if (a == NCCL_ALGO_TREE && comm->maxTreePattern == NCCL_TOPO_PATTERN_TREE) {
+          INFO(NCCL_TUNING, "%s: tree_pattern_tree refinement: busBw[%f] *= 0.85 (before: %f)", ncclFuncToString((ncclFunc_t)coll), busBw*.85, busBw);
+          busBw *= .85;
+        }
+        if (a == NCCL_ALGO_PAT) {
+          INFO(NCCL_TUNING, "%s: pat refinement: busBw[%f] *= 0.75 (before: %f)", ncclFuncToString((ncclFunc_t)coll), busBw*.75, busBw);
+          busBw *= .75;
+        }
+        if (a == NCCL_ALGO_COLLNET_DIRECT && p != NCCL_PROTO_SIMPLE) {
+          INFO(NCCL_TUNING, "%s: collnet_direct_simple refinement: busBw = 0;  // Not used", ncclFuncToString((ncclFunc_t)coll));
+          busBw = 0;  // Not used
+        }
+        if (a == NCCL_ALGO_COLLNET_CHAIN && p != NCCL_PROTO_SIMPLE) {
+          INFO(NCCL_TUNING, "%s: collnet_chain_simple refinement: busBw = 0;  // Not used", ncclFuncToString((ncclFunc_t)coll));
+          busBw = 0;  // Not used
+        }
         if (a == NCCL_ALGO_COLLNET_DIRECT && p == NCCL_PROTO_SIMPLE) {
           if (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter) {
+            INFO(NCCL_TUNING, "%s: all_gather_or_reduce_scatter refinement: busBw[%f] = ppn[%f] * std::min(graphs[a]->bwIntra[%f], graphs[a]->bwInter[%f] * 0.9f)", ncclFuncToString((ncclFunc_t)coll), ppn * std::min(graphs[a]->bwIntra, graphs[a]->bwInter * 0.9f), ppn, graphs[a]->bwIntra, graphs[a]->bwInter);
             busBw = ppn * std::min(graphs[a]->bwIntra, graphs[a]->bwInter * 0.9f);
           } else {
             // Collnet+Direct requires all GPUs to have a local NIC to work at full speed
+            INFO(NCCL_TUNING, "%s: else_all_gather_or_reduce_scatter refinement: factor[%f] = ppn[%f] / (1.0*graphs[a]->nChannels[%d])", ncclFuncToString((ncclFunc_t)coll), ppn / (1.0*graphs[a]->nChannels), ppn, graphs[a]->nChannels);
             float factor = ppn / (1.0*graphs[a]->nChannels); // GPU/NIC ratio
+            INFO(NCCL_TUNING, "%s: else_all_gather_or_reduce_scatter refinement: factor[%f] -= (factor[%f]-1)/2", ncclFuncToString((ncclFunc_t)coll), factor - (factor-1)/2, factor);
             factor -= (factor-1)/2;
+            INFO(NCCL_TUNING, "%s: else_all_gather_or_reduce_scatter refinement: busBw[%f] /= factor[%f] (before: %f)", ncclFuncToString((ncclFunc_t)coll), busBw/factor, factor, busBw);
             busBw /= factor;
-            if (minCompCap >= 90) busBw *= .85;
+            if (minCompCap >= 90) {
+              INFO(NCCL_TUNING, "%s: else_all_gather_or_reduce_scatter minCompCap[%d]>90 refinement: busBw[%f] *= .85 (before: %f)", ncclFuncToString((ncclFunc_t)coll), minCompCap, busBw*.85, busBw);
+              busBw *= .85;
+            }
           }
         }
         // disable collnet for allgather/reducescatter if #localranks > #heads
@@ -345,56 +388,92 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
         // Convert bus BW to algorithm BW
         if (!(a != NCCL_ALGO_RING && (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter))) {
           float ratio = 1.0f;
-          if (a == NCCL_ALGO_RING || a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) ratio *= (1.0 * nRanks) / nsteps;
-          else ratio *= .5;
+          INFO(NCCL_TUNING, "%s: convert to algo BW: ratio = 1.0f", ncclFuncToString((ncclFunc_t)coll));
+          if (a == NCCL_ALGO_RING || a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) {
+            INFO(NCCL_TUNING, "%s: convert to algo BW: ratio[%f] *= (1.0 * nRanks[%d]) / nsteps[%d] (before: %f)", ncclFuncToString((ncclFunc_t)coll), ratio*(1.0 * nRanks) / nsteps, nRanks, nsteps, ratio);
+            ratio *= (1.0 * nRanks) / nsteps;
+          } else {
+            INFO(NCCL_TUNING, "%s: convert to algo BW: ratio[%f] *= .5 (before: %f)", ncclFuncToString((ncclFunc_t)coll), ratio*.5, ratio);
+            ratio *= .5;
+          }
           busBw *= ratio;
         }
+        INFO(NCCL_TUNING, "%s: comm->bandwidths[coll][a[%s]][p[%s]] = busBw[%f]", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), busBw);
         comm->bandwidths[coll][a][p] = busBw;
         comm->latencies[coll][a][p] = comm->tunerConstants.baseLatencies[a][p];
+        INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] = comm->tunerConstants.baseLatencies[%s][%s][%f]", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p], ncclAlgoToString(a), ncclProtoToString(p), comm->tunerConstants.baseLatencies[a][p]);
         float intraLat = comm->tunerConstants.hwLatencies[intraHw[a]][a][p];
         // With ppn=1 latencies are fully exposed, use the Tree network latency
         float interLat = ppn == 1 ? comm->tunerConstants.hwLatencies[NCCL_HW_NET][NCCL_ALGO_TREE][p] : comm->tunerConstants.hwLatencies[NCCL_HW_NET][a][p];
+        INFO(NCCL_TUNING, "%s: interLat[%f] = ppn[%f] == 1 ? comm->tunerConstants.hwLatencies[NCCL_HW_NET][NCCL_ALGO_TREE][%s][%f] : comm->tunerConstants.hwLatencies[NCCL_HW_NET][%s][%s][%f];", ncclFuncToString((ncclFunc_t)coll), interLat, ppn, ncclProtoToString(p), comm->tunerConstants.hwLatencies[NCCL_HW_NET][NCCL_ALGO_TREE][p], ncclAlgoToString(a), ncclProtoToString(p), comm->tunerConstants.hwLatencies[NCCL_HW_NET][a][p]);
         interLat += graphs[a]->latencyInter;
+        INFO(NCCL_TUNING, "%s: interLat[%f] += graphs[%s]->latencyInter[%f]", ncclFuncToString((ncclFunc_t)coll), interLat, ncclAlgoToString(a), graphs[a]->latencyInter);
         // Also add the flush extra latency
-        if (p == NCCL_PROTO_SIMPLE) interLat += graphs[a]->latencyInter;
+        if (p == NCCL_PROTO_SIMPLE) {
+          interLat += graphs[a]->latencyInter;
+          INFO(NCCL_TUNING, "%s: interLat[%f] += graphs[%s]->latencyInter[%f] //Also add the flush extra latency", ncclFuncToString((ncclFunc_t)coll), interLat, ncclAlgoToString(a), graphs[a]->latencyInter);
+        }
 
         if (a == NCCL_ALGO_RING) {
           float lat = comm->tunerConstants.hwLatencies[hw[a]][a][p];
+          INFO(NCCL_TUNING, "%s: lat[%f] = comm->tunerConstants.hwLatencies[hw[%s][%d]][%s][%s][%f]", ncclFuncToString((ncclFunc_t)coll), lat, ncclAlgoToString(a), hw[a], ncclAlgoToString(a), ncclProtoToString(p), comm->tunerConstants.hwLatencies[hw[a]][a][p]);
           if ((coll == ncclFuncReduce || coll == ncclFuncBroadcast)) {
             if (graphs[a]->sameChannels) {
+              INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += lat[%f] (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + lat, lat, comm->latencies[coll][a][p]);
               comm->latencies[coll][a][p] += lat;
             } else {
-              if (p == NCCL_PROTO_SIMPLE) lat = comm->tunerConstants.hwLatencies[hw[a]][NCCL_ALGO_TREE][p]; // Add some chunk latency, waiting for proper chunk modeling
+              if (p == NCCL_PROTO_SIMPLE) {
+                lat = comm->tunerConstants.hwLatencies[hw[a]][NCCL_ALGO_TREE][p]; // Add some chunk latency, waiting for proper chunk modeling
+                INFO(NCCL_TUNING, "%s: lat[%f] = comm->tunerConstants.hwLatencies[hw[%s][%d]][NCCL_ALGO_TREE][%s][%f] // Add some chunk latency, waiting for proper chunk modeling", ncclFuncToString((ncclFunc_t)coll), lat, ncclAlgoToString(a), hw[a], ncclProtoToString(p), comm->tunerConstants.hwLatencies[hw[a]][NCCL_ALGO_TREE][p]);
+              }
+              INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += nsteps[%d]*lat[%f] (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + nsteps*lat, nsteps, lat, comm->latencies[coll][a][p]);
               comm->latencies[coll][a][p] += nsteps*lat;
             }
           } else {
             // Inter-node rings still have to launch nsteps * net overhead.
             float netOverhead = 0.0;
+            INFO(NCCL_TUNING, "%s: netOverhead = 0.0", ncclFuncToString((ncclFunc_t)coll));
             if (nNodes > 1) {
               netOverhead = getNetOverhead(comm);
-              if (p == NCCL_PROTO_SIMPLE) netOverhead *= 3;
+              INFO(NCCL_TUNING, "%s: netOverhead[%f] = getNetOverhead(comm)", ncclFuncToString((ncclFunc_t)coll), netOverhead);
+              if (p == NCCL_PROTO_SIMPLE) {
+                INFO(NCCL_TUNING, "%s: netOverhead %f *= 3 (old value %f", ncclFuncToString((ncclFunc_t)coll), netOverhead * 3, netOverhead);
+                netOverhead *= 3;
+              }
             }
+            INFO(NCCL_TUNING, "%s: intraLat[%f] = std::max(intraLat[%f], netOverhead[%f])", ncclFuncToString((ncclFunc_t)coll), std::max(intraLat, netOverhead), intraLat, netOverhead);
             intraLat = std::max(intraLat, netOverhead);
             int nInterSteps = nNodes == 1 ? 0 : coll == ncclFuncAllReduce ? 2*(nNodes-1) : nNodes-1;
+            INFO(NCCL_TUNING, "%s: nInterSteps[%d] = nNodes[%d] == 1 ? 0 : coll == ncclFuncAllReduce ? 2*(nNodes[%d]-1) : nNodes[%d]-1", ncclFuncToString((ncclFunc_t)coll), nInterSteps, nNodes, nNodes, nNodes);
+            INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += (nsteps[%d]-nInterSteps[%d])*intraLat[%f] + nInterSteps[%d]*interLat[%f] (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + (nsteps-nInterSteps)*intraLat + nInterSteps*interLat, nsteps, nInterSteps, intraLat, nInterSteps, interLat, comm->latencies[coll][a][p]);
             comm->latencies[coll][a][p] += (nsteps-nInterSteps)*intraLat + nInterSteps*interLat;
           }
         } else if (a == NCCL_ALGO_TREE) {
           if (coll == ncclFuncAllReduce) {
+            INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += 2 * ((nRanks[%d]/nNodes[%d]-1) * intraLat[%f] + log2i(nNodes[%d])[%ld] * interLat[%f]) (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + 2 * ((nRanks/nNodes-1) * intraLat + log2i(nNodes) * interLat), nRanks, nNodes, intraLat, nNodes, log2i(nNodes), interLat, comm->latencies[coll][a][p]);
             comm->latencies[coll][a][p] +=
               2 * ((nRanks/nNodes-1) * intraLat + log2i(nNodes) * interLat);
           }
         } else if (a == NCCL_ALGO_COLLNET_DIRECT) {
+          INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += 2 * (std::min(1, (nRanks[%d]/nNodes[%d]-1)) * intraLat[%f] + (nRanks[%d]/nNodes[%d]-1) * 0.4) + interLat[%f];  // Add 0.4 us arity serialization latency (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + 2 * (std::min(1, (nRanks/nNodes-1)) * intraLat + (nRanks/nNodes-1) * 0.4) + interLat, nRanks, nNodes, intraLat, nRanks, nNodes, interLat, comm->latencies[coll][a][p]);
           comm->latencies[coll][a][p] +=
             2 * (std::min(1, (nRanks/nNodes-1)) * intraLat + (nRanks/nNodes-1) * 0.4) + interLat;  // Add 0.4 us arity serialization latency
         } else if (a == NCCL_ALGO_COLLNET_CHAIN) {
+          INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += 2 * (nRanks[%d]/nNodes[%d]-1) * intraLat[%f] + interLat[%f] (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + 2 * (nRanks/nNodes-1) * intraLat + interLat, nRanks, nNodes, intraLat, interLat, comm->latencies[coll][a][p]);
           comm->latencies[coll][a][p] += 2 * (nRanks/nNodes-1) * intraLat + interLat;
         } else if (a == NCCL_ALGO_NVLS) {
+          INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] = intraLat", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p]);
           comm->latencies[coll][a][p] = intraLat;
-          if (nNodes > 1) comm->latencies[coll][a][p] += interLat;
+          if (nNodes > 1) {
+            INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += interLat[%f] (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + interLat, interLat, comm->latencies[coll][a][p]);
+            comm->latencies[coll][a][p] += interLat;
+          }
         } else if (a == NCCL_ALGO_NVLS_TREE) {
+          INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += intraLat[%f] + 2 * log2i(nNodes[%d])[%ld] * interLat[%f] (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + intraLat + 2 * log2i(nNodes) * interLat, intraLat, nNodes, log2i(nNodes), interLat, comm->latencies[coll][a][p]);
           comm->latencies[coll][a][p] += intraLat + 2 * log2i(nNodes) * interLat;
         } else if (a == NCCL_ALGO_PAT) {
           if (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter) {
+            INFO(NCCL_TUNING, "%s: comm->latencies[coll][%s][%s][%f] += log2i(nNodes[%d])[%ld] * (interLat[%f]/3.5) + nRanks[%d] * 2.8 (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(a), ncclProtoToString(p), comm->latencies[coll][a][p] + log2i(nNodes) * (interLat/3.5) + nRanks * 2.8, nNodes, log2i(nNodes), interLat/3.5, nRanks, comm->latencies[coll][a][p]);
             comm->latencies[coll][a][p] += log2i(nNodes) * (interLat/3.5) // Log latency
               + nRanks * 2.8; // Still a linear part; hopefully we'll manage to remove it at some point.
           }
@@ -584,18 +663,27 @@ static float treeCorrectionFactor[NCCL_NUM_PROTOCOLS][23] = {
 ncclResult_t ncclTopoGetAlgoTime(struct ncclComm* comm, int coll, int algorithm, int protocol, size_t nBytes, int numPipeOps, float* time) {
   float bw = comm->bandwidths[coll][algorithm][protocol];
   float lat = comm->latencies[coll][algorithm][protocol];
+  INFO(NCCL_TUNING, "%s: algo: %s, proto: %s, nBytes: %ld, numPipeOps: %d, bw: %f, lat: %f", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(algorithm), ncclProtoToString(protocol), nBytes, numPipeOps, bw, lat);
 
   if (bw == 0) {
+    INFO(NCCL_TUNING, "%s: algo: %s, proto: %s, bw == 0, set time to -1", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(algorithm), ncclProtoToString(protocol));
     *time = -1.0; return ncclSuccess;
   }
   int logSize = log2i(nBytes>>6);
-  if (algorithm == NCCL_ALGO_TREE && coll == ncclFuncAllReduce && logSize >= 0 && logSize < 23) bw *= treeCorrectionFactor[protocol][logSize];
+  INFO(NCCL_TUNING, "%s: algo: %s, proto: %s, logSize: %d", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(algorithm), ncclProtoToString(protocol), logSize);
+  if (algorithm == NCCL_ALGO_TREE && coll == ncclFuncAllReduce && logSize >= 0 && logSize < 23) {
+    INFO(NCCL_TUNING, "%s: algo: %s, proto: %s, bw[%f] *= treeCorrectionFactor[protocol][logSize[%d]][%f]", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(algorithm), ncclProtoToString(protocol), bw*treeCorrectionFactor[protocol][logSize], logSize, treeCorrectionFactor[protocol][logSize]);
+    bw *= treeCorrectionFactor[protocol][logSize];
+  }
   if (algorithm == NCCL_ALGO_RING && protocol == NCCL_PROTO_SIMPLE && comm->nNodes > 1
       && coll == ncclFuncAllReduce && nBytes/(comm->nChannels*comm->nRanks) >= 64) {
+    INFO(NCCL_TUNING, "%s: algo: %s, proto: %s, lat[%f] *= comm->minCompCap[%d] < 80 ? 1.9 : 1.4 // Plateau effect of ring (old value %f)", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(algorithm), ncclProtoToString(protocol), lat*(comm->minCompCap < 80 ? 1.9 : 1.4), comm->minCompCap, lat);
     lat *= comm->minCompCap < 80 ? 1.9 : 1.4; // Plateau effect of ring
   }
   // Tree pipelining saves latency in aggregation cases
+  INFO(NCCL_TUNING, "%s: algo: %s, proto: %s, latCount[%d] = algorithm == NCCL_ALGO_RING ? numPipeOps[%d] : DIVUP(numPipeOps[%d], NCCL_MAX_DEV_WORK_BATCH_COLLS[%ld])[%ld]", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(algorithm), ncclProtoToString(protocol), int(algorithm == NCCL_ALGO_RING ? numPipeOps : DIVUP(numPipeOps, NCCL_MAX_DEV_WORK_BATCH_COLLS)), numPipeOps, numPipeOps, NCCL_MAX_DEV_WORK_BATCH_COLLS, DIVUP(numPipeOps, NCCL_MAX_DEV_WORK_BATCH_COLLS));
   int latCount = algorithm == NCCL_ALGO_RING ? numPipeOps : DIVUP(numPipeOps, NCCL_MAX_DEV_WORK_BATCH_COLLS);
+  INFO(NCCL_TUNING, "%s: algo: %s, proto: %s, *time[%f] = (lat[%f] * latCount[%d])[%f] + (nBytes[%ld] / (1000 * bw[%f]))[%f]", ncclFuncToString((ncclFunc_t)coll), ncclAlgoToString(algorithm), ncclProtoToString(protocol), lat * latCount + nBytes / (1000 * bw), lat, latCount, lat * latCount, nBytes, bw, nBytes / (1000 * bw));
   *time = lat * latCount + nBytes / (1000 * bw);
   return ncclSuccess;
 }
